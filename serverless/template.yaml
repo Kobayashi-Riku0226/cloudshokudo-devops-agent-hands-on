@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: User API
+
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: get-user-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamodb-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt UsersTable.Arn
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/get-user
+
+  GetUserFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: get-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      Runtime: python3.14
+      MemorySize: 128
+      Timeout: 3
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UsersTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+
+          def handler(event, context):
+              userid = event.get("queryStringParameters", {}).get("userid")
+              if not userid:
+                  return {"statusCode": 400, "body": json.dumps({"error": "userid is required"})}
+
+              try:
+                  response = table.get_item(Key={"id": int(userid)})
+                  item = response.get("Item")
+                  if not item:
+                      return {"statusCode": 404, "body": json.dumps({"error": "User not found"})}
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "username": item["username"],
+                          "registered_date": item["registered_date"],
+                      }),
+                  }
+              except Exception:
+                  return {"statusCode": 500, "body": json.dumps({"error": "Internal server error"})}
+
+  UserApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: user-api
+      EndpointConfiguration:
+        Types:
+          - EDGE
+
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserApi
+      ParentId: !GetAtt UserApi.RootResourceId
+      PathPart: users
+
+  GetUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.userid: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUserFunction.Arn}/invocations
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetUserFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${UserApi}/*/*
+
+  # Increment this logical ID and the stage reference when changing API configuration.
+  ApiDeploymentV1:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetUserMethod
+      - ApiGatewayInvokePermission
+    Properties:
+      RestApiId: !Ref UserApi
+
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref UserApi
+      DeploymentId: !Ref ApiDeploymentV1
+      StageName: prod
+
+Outputs:
+  ApiEndpoint:
+    Description: Equivalent to the api_endpoint output.
+    Value: !Sub https://${UserApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ProdStage}/users
