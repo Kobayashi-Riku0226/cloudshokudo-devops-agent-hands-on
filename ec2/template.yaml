@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Cloud Shokudo #10 - AWS DevOps Agent hands-on (OS scenario).
+  EC2 (nginx) + CloudWatch Agent + HTTP health check metric + CloudWatch alarm.
+
+Parameters:
+  AllowedHttpCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to access the web page on port 80 (e.g. your IP x.x.x.x/32)
+  AutoShutdownMinutes:
+    Type: Number
+    Default: 180
+    MinValue: 0
+    Description: Minutes until the instance shuts down (and terminates) automatically. 0 disables it.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to the web server (no SSH, use Session Manager)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedHttpCidr
+          Description: HTTP
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-web-sg
+
+  # ---------------------------------------------------------------- IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------- Logs
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub /cloud-shokudo/${AWS::StackName}/web
+      RetentionInDays: 3
+
+  # ---------------------------------------------------------------- EC2
+  WebInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicDefaultRoute
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      InstanceInitiatedShutdownBehavior: terminate
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-web
+        - Key: Purpose
+          Value: cloud-shokudo-devops-agent-handson
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+
+          # --- packages
+          dnf install -y nginx amazon-cloudwatch-agent rsyslog
+          systemctl enable --now rsyslog
+
+          # --- sample page
+          cat > /usr/share/nginx/html/index.html << 'HTML'
+          <!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8"><title>Cloud Shokudo</title></head>
+          <body><h1>Welcome to Cloud Shokudo #10</h1><p>If you can see this page, the web server is healthy.</p></body></html>
+          HTML
+          systemctl enable --now nginx
+
+          # --- HTTP health check (every minute -> custom metric Shokudo/WebApp HttpCheckSuccess)
+          mkdir -p /opt/shokudo /var/log/shokudo
+          cat > /opt/shokudo/healthcheck.sh << 'SCRIPT'
+          #!/bin/bash
+          TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost/)
+          if [ "$CODE" = "200" ]; then VALUE=1; else VALUE=0; fi
+          echo "$(date -Is) http_check url=http://localhost/ status_code=$CODE success=$VALUE" >> /var/log/shokudo/healthcheck.log
+          aws cloudwatch put-metric-data --region ${AWS::Region} \
+            --namespace Shokudo/WebApp --metric-name HttpCheckSuccess \
+            --dimensions InstanceId=$IID --value $VALUE --unit Count
+          SCRIPT
+          chmod +x /opt/shokudo/healthcheck.sh
+
+          cat > /etc/systemd/system/shokudo-healthcheck.service << 'UNIT'
+          [Unit]
+          Description=Cloud Shokudo HTTP health check
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/shokudo/healthcheck.sh
+          UNIT
+          cat > /etc/systemd/system/shokudo-healthcheck.timer << 'UNIT'
+          [Unit]
+          Description=Run Cloud Shokudo HTTP health check every minute
+          [Timer]
+          OnBootSec=1min
+          OnUnitActiveSec=1min
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now shokudo-healthcheck.timer
+
+          # --- CloudWatch Agent (logs + memory/disk metrics)
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/shokudo.json << 'JSON'
+          {
+            "agent": { "run_as_user": "root" },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    { "file_path": "/var/log/nginx/error.log",           "log_group_name": "${WebLogGroup}", "log_stream_name": "{instance_id}/nginx-error" },
+                    { "file_path": "/var/log/nginx/access.log",          "log_group_name": "${WebLogGroup}", "log_stream_name": "{instance_id}/nginx-access" },
+                    { "file_path": "/var/log/messages",                  "log_group_name": "${WebLogGroup}", "log_stream_name": "{instance_id}/messages" },
+                    { "file_path": "/var/log/shokudo/healthcheck.log",   "log_group_name": "${WebLogGroup}", "log_stream_name": "{instance_id}/healthcheck" }
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "namespace": "CWAgent",
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+              "metrics_collected": {
+                "mem":  { "measurement": ["mem_used_percent"] },
+                "disk": { "measurement": ["used_percent"], "resources": ["/"] }
+              }
+            }
+          }
+          JSON
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/shokudo.json
+
+          # --- safety: auto shutdown (instance terminates on shutdown)
+          if [ "${AutoShutdownMinutes}" -gt 0 ]; then
+            shutdown -h +${AutoShutdownMinutes}
+          fi
+
+  # ---------------------------------------------------------------- Alarm
+  HttpCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-web-http-check-failed
+      AlarmDescription: !Sub >-
+        Web server on the EC2 instance is not returning HTTP 200 (health check from localhost).
+        Logs: CloudWatch Logs group /cloud-shokudo/${AWS::StackName}/web
+      Namespace: Shokudo/WebApp
+      MetricName: HttpCheckSuccess
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebInstance
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing
+
+Outputs:
+  InstanceId:
+    Value: !Ref WebInstance
+  WebUrl:
+    Description: Open in your browser
+    Value: !Sub http://${WebInstance.PublicDnsName}/
+  LogGroupName:
+    Value: !Ref WebLogGroup
+  AlarmName:
+    Value: !Ref HttpCheckAlarm
+  SessionManagerUrl:
+    Description: Connect to the instance with Session Manager
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${WebInstance}?region=${AWS::Region}
