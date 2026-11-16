@@ -1,5 +1,36 @@
 # cloudshokudo-devops-agent-hands-on
 
+## リポジトリの取得と作業ディレクトリへの移動
+
+AWS CloudShellまたはGitが利用できるターミナルで、リポジトリをクローンし、ルートディレクトリへ移動します。
+
+```bash
+git clone https://github.com/Kobayashi-Riku0226/cloudshokudo-devops-agent-hands-on.git
+cd cloudshokudo-devops-agent-hands-on
+```
+
+取得済みの場合はクローンを省略し、既存のリポジトリのルートディレクトリを開いてください。続いて、実施する構成のディレクトリへ移動します。以下の `cd` コマンドは、それぞれリポジトリのルートから実行してください。
+
+### サーバーレス構成
+
+```bash
+cd serverless
+```
+
+移動後は、[serverless/README.md](serverless/README.md)に従って、デプロイ、動作確認、IAMポリシーの削除による障害再現、復旧を進めてください。各AWS CLIコマンドは `serverless` ディレクトリで実行します。
+
+### EC2構成
+
+```bash
+cd ec2
+```
+
+移動後は、[ec2/README.md](ec2/README.md)に従って、デプロイ、動作確認、nginxの設定ミスによる障害再現、DevOps Agentでの調査、復旧を進めてください。すでにリポジトリを取得して移動済みの場合は、EC2側のREADMEにある `git clone` とディレクトリ移動のコマンドを省略し、デプロイのコマンドから実行します。各AWS CLIコマンドは `ec2` ディレクトリで実行します。
+
+`serverless` から続けてEC2構成へ移動する場合は、`cd ../ec2` を実行してください。
+
+AWS DevOps Agentで調査するためのエージェントスペースは、以下の手順で作成します。
+
 ## AWS DevOps Agentのエージェントスペース作成
 
 エージェントスペース（Agent Space）は、AWS DevOps Agentが調査できるAWSリソースや外部ツール、利用者のアクセス範囲を設定する単位です。ここでは、AWSマネジメントコンソールでハンズオン用のスペースを作成し、Webアプリを開くまでを説明します。
